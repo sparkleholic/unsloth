@@ -392,7 +392,7 @@ def apply_chat_template_to_dataset(
 
                 threading.Thread(target = _poll_tqdm, daemon = True).start()
 
-            formatted_dataset = dataset.map(_format_chatml, **dataset_map_kwargs)
+            formatted_dataset = dataset.map(_format_chatml, remove_columns=dataset.column_names, **dataset_map_kwargs)
 
             if _tqdm_monitor_stop is not None:
                 _tqdm_monitor_stop.set()
