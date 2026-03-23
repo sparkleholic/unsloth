@@ -11,6 +11,8 @@ through its OpenAI-compatible /v1/chat/completions endpoint.
 import atexit
 import contextlib
 import json
+import os
+import shlex
 import struct
 import structlog
 from loggers import get_logger
@@ -18,6 +20,8 @@ import shutil
 import signal
 import socket
 import subprocess
+import tempfile
+import sys
 import threading
 import time
 from pathlib import Path
@@ -26,6 +30,40 @@ from typing import Generator, Optional
 import httpx
 
 logger = get_logger(__name__)
+
+
+class _PosixSpawnProcess:
+    """Minimal subprocess-compatible wrapper for a posix_spawn() child."""
+
+    def __init__(self, pid: int):
+        self.pid = pid
+        self.returncode: Optional[int] = None
+        self.stdout = None
+
+    def poll(self) -> Optional[int]:
+        if self.returncode is not None:
+            return self.returncode
+        pid, status = os.waitpid(self.pid, os.WNOHANG)
+        if pid == 0:
+            return None
+        self.returncode = os.waitstatus_to_exitcode(status)
+        return self.returncode
+
+    def wait(self, timeout: Optional[float] = None) -> int:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            rc = self.poll()
+            if rc is not None:
+                return rc
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(cmd = self.pid, timeout = timeout)
+            time.sleep(0.05)
+
+    def terminate(self) -> None:
+        os.kill(self.pid, signal.SIGTERM)
+
+    def kill(self) -> None:
+        os.kill(self.pid, signal.SIGKILL)
 
 
 class LlamaCppBackend:
@@ -56,6 +94,8 @@ class LlamaCppBackend:
         self._lock = threading.Lock()
         self._stdout_lines: list[str] = []
         self._stdout_thread: Optional[threading.Thread] = None
+        self._stdout_log_file = None
+        self._stdout_log_path: Optional[str] = None
         self._cancel_event = threading.Event()
 
         self._kill_orphaned_servers()
@@ -402,6 +442,17 @@ class LlamaCppBackend:
         except (ValueError, OSError):
             # Pipe closed — process is terminating
             pass
+
+    def _read_stdout_log_tail(self, max_lines: int = 50) -> str:
+        """Read recent subprocess output from the temp log file."""
+        if not self._stdout_log_path:
+            return ""
+        try:
+            with open(self._stdout_log_path, "r", encoding = "utf-8", errors = "replace") as f:
+                lines = f.readlines()
+            return "\n".join(line.rstrip() for line in lines[-max_lines:])
+        except Exception:
+            return ""
 
     # GGUF KV type sizes for fast skipping
     _GGUF_TYPE_SIZE = {
@@ -841,6 +892,16 @@ class LlamaCppBackend:
                 logger.warning(f"GPU selection failed ({e}), using --fit on")
                 gpu_indices, use_fit = None, True
 
+            requested_n_ctx = int(n_ctx) if n_ctx else 4096
+            effective_n_ctx = max(
+                1,
+                min(requested_n_ctx, self._context_length or requested_n_ctx),
+            )
+            logger.info(
+                f"Using context length: requested={requested_n_ctx}, "
+                f"effective={effective_n_ctx}, model_max={self._context_length}"
+            )
+
             cmd = [
                 binary,
                 "-m",
@@ -848,7 +909,7 @@ class LlamaCppBackend:
                 "--port",
                 str(self._port),
                 "-c",
-                "0",  # 0 = use model's native context size
+                str(effective_n_ctx),
                 "--parallel",
                 "1",  # Single-user studio, saves VRAM
                 "--flash-attn",
@@ -863,6 +924,9 @@ class LlamaCppBackend:
 
             # Always enable Jinja chat template rendering for proper template support
             cmd.extend(["--jinja"])
+            
+            # Intel mac (not enough VRAM)
+            cmd.extend(["--n-gpu-layers", "0"])
 
             # KV cache data type
             _valid_cache_types = {
@@ -887,8 +951,6 @@ class LlamaCppBackend:
 
             # Apply custom chat template override if provided
             if chat_template_override:
-                import tempfile
-
                 self._chat_template_file = tempfile.NamedTemporaryFile(
                     mode = "w",
                     suffix = ".jinja",
@@ -928,19 +990,14 @@ class LlamaCppBackend:
                     f"Reasoning model: enable_thinking={thinking_default} by default"
                 )
 
+            resolved_mmproj_path: Optional[str] = None
             if mmproj_path:
                 if not Path(mmproj_path).is_file():
                     logger.warning(f"mmproj file not found: {mmproj_path}")
                 else:
-                    cmd.extend(["--mmproj", mmproj_path])
-                    logger.info(f"Using mmproj for vision: {mmproj_path}")
-
-            logger.info(f"Starting llama-server: {' '.join(cmd)}")
+                    resolved_mmproj_path = mmproj_path
 
             # Set library paths so llama-server can find its shared libs and CUDA DLLs
-            import os
-            import sys
-
             env = os.environ.copy()
             binary_dir = str(Path(binary).parent)
 
@@ -985,24 +1042,64 @@ class LlamaCppBackend:
                     f"{new_ld}:{existing_ld}" if existing_ld else new_ld
                 )
 
+            child_env = env
+
             # Pin to selected GPU(s) via CUDA_VISIBLE_DEVICES
             if gpu_indices is not None:
-                env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in gpu_indices)
+                child_env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in gpu_indices)
+            if resolved_mmproj_path:
+                cmd.extend(["--mmproj", resolved_mmproj_path])
+                logger.info(f"Using mmproj for vision: {resolved_mmproj_path}")
+                 # Intel mac (not enough VRAM)
+                cmd.extend(["--no-mmproj-offload"])
+
+            logger.info(f"Starting llama-server: {shlex.join(cmd)}")
 
             self._stdout_lines = []
-            self._process = subprocess.Popen(
-                cmd,
-                stdout = subprocess.PIPE,
-                stderr = subprocess.STDOUT,
-                text = True,
-                env = env,
-            )
+            self._stdout_log_path = None
+            self._stdout_log_file = None
 
-            # Start background thread to drain stdout and prevent pipe deadlock
-            self._stdout_thread = threading.Thread(
-                target = self._drain_stdout, daemon = True, name = "llama-stdout"
-            )
-            self._stdout_thread.start()
+            if sys.platform == "darwin":
+                self._stdout_log_file = tempfile.NamedTemporaryFile(
+                    mode = "w+",
+                    encoding = "utf-8",
+                    delete = False,
+                    prefix = "unsloth_llama_server_",
+                    suffix = ".log",
+                )
+                self._stdout_log_path = self._stdout_log_file.name
+                logger.info(f"Redirecting llama-server output to {self._stdout_log_path}")
+                fd = os.open(self._stdout_log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                try:
+                    file_actions = [
+                        (os.POSIX_SPAWN_DUP2, fd, 1),
+                        (os.POSIX_SPAWN_DUP2, fd, 2),
+                        (os.POSIX_SPAWN_CLOSE, fd),
+                    ]
+                    self._process = _PosixSpawnProcess(
+                        os.posix_spawn(
+                            cmd[0],
+                            cmd,
+                            child_env,
+                            file_actions = file_actions,
+                        )
+                    )
+                finally:
+                    os.close(fd)
+                self._stdout_thread = None
+            else:
+                self._process = subprocess.Popen(
+                    cmd,
+                    stdout = subprocess.PIPE,
+                    stderr = subprocess.STDOUT,
+                    text = True,
+                    env = child_env,
+                )
+
+                self._stdout_thread = threading.Thread(
+                    target = self._drain_stdout, daemon = True, name = "llama-stdout"
+                )
+                self._stdout_thread.start()
 
             self._gguf_path = gguf_path
             self._hf_repo = hf_repo
@@ -1083,6 +1180,13 @@ class LlamaCppBackend:
             if self._stdout_thread is not None:
                 self._stdout_thread.join(timeout = 2)
                 self._stdout_thread = None
+            if self._stdout_log_file is not None:
+                try:
+                    self._stdout_log_file.flush()
+                    self._stdout_log_file.close()
+                except Exception:
+                    pass
+                self._stdout_log_file = None
 
     @staticmethod
     def _kill_orphaned_servers():
@@ -1145,6 +1249,8 @@ class LlamaCppBackend:
                 if self._stdout_thread is not None:
                     self._stdout_thread.join(timeout = 2)
                 output = "\n".join(self._stdout_lines[-50:])
+                if not output:
+                    output = self._read_stdout_log_tail()
                 logger.error(
                     f"llama-server exited with code {self._process.returncode}. "
                     f"Output: {output[:2000]}"

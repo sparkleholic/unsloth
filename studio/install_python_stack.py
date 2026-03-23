@@ -13,6 +13,7 @@ PATH to point at the venv.
 from __future__ import annotations
 
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -318,12 +319,26 @@ def install_python_stack() -> int:
 
     # 3b. Extra dependencies (no-deps) — audio model support etc.
     _progress("extra codecs")
+    extras_no_deps_req = REQ_ROOT / "extras-no-deps.txt"
+    if sys.platform == "darwin" and platform.machine() == "x86_64":
+        # These optional codec/runtime extras currently do not have stable wheel
+        # support on macOS Intel and can fail from source builds.
+        extras_no_deps_req = _filter_requirements(
+            extras_no_deps_req,
+            {
+                "torchcodec",
+                "torch-c-dlpack-ext",
+                "git+https://github.com/meta-pytorch/OpenEnv.git",
+            },
+        )
     pip_install(
         "Installing extras (no-deps)",
         "--no-deps",
         "--no-cache-dir",
-        req = REQ_ROOT / "extras-no-deps.txt",
+        req = extras_no_deps_req,
     )
+    if extras_no_deps_req != REQ_ROOT / "extras-no-deps.txt":
+        extras_no_deps_req.unlink(missing_ok = True)
 
     # 4. Overrides (torchao, transformers) — force-reinstall
     _progress("dependency overrides")

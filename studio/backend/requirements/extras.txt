@@ -47,7 +47,7 @@ torch-stoi
 evaluate
 timm
 transformers-cfg
-open_spiel
+open_spiel ; (sys_platform != 'darwin') or (platform_machine != 'x86_64') or (python_version != '3.12')
 addict
 easydict
 einops

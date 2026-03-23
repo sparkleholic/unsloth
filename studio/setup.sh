@@ -224,6 +224,23 @@ if [ -n "${REQUESTED_PYTHON_VERSION:-}" ] && [ -x "$REQUESTED_PYTHON_VERSION" ];
     fi
 fi
 
+# If no explicit request was provided, prefer the currently active `python`
+# (for example from an activated virtual environment) before scanning all
+# python3.X commands. This avoids accidentally selecting a newer system
+# interpreter that has poorer wheel availability for some packages.
+if [ -z "$BEST_PY" ] && command -v python &>/dev/null; then
+    _active_py="$(command -v python)"
+    _active_ver=$("$_active_py" --version 2>&1 | awk '{print $2}')
+    _active_major=$(echo "$_active_ver" | cut -d. -f1)
+    _active_minor=$(echo "$_active_ver" | cut -d. -f2)
+    if [ "$_active_major" -eq 3 ] 2>/dev/null && \
+       [ "$_active_minor" -ge "$MIN_PY_MINOR" ] 2>/dev/null && \
+       [ "$_active_minor" -le "$MAX_PY_MINOR" ] 2>/dev/null; then
+        BEST_PY="$_active_py"
+        echo "Using active Python interpreter: $BEST_PY"
+    fi
+fi
+
 if [ -z "$BEST_PY" ]; then
 # Collect candidate python3 binaries (python3, python3.9, python3.10, …)
 for candidate in $(compgen -c python3 2>/dev/null | grep -E '^python3(\.[0-9]+)?$' | sort -u); do

@@ -14,3 +14,8 @@ mcp>=1.24,<2
 websockets>=15.0.1
 
 pandas==2.3.3
+
+# macOS Intel + Python 3.12: avoid llvmlite source build path that fails with
+# newer setuptools/distutils APIs and prefer wheel-backed versions.
+numba==0.62.1 ; (sys_platform == 'darwin') and (platform_machine == 'x86_64') and (python_version == '3.12')
+llvmlite==0.45.1 ; (sys_platform == 'darwin') and (platform_machine == 'x86_64') and (python_version == '3.12')
